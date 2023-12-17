@@ -20,7 +20,7 @@ type MeshServer interface {
 
 	GetGameName() string
 
-	GetClientsInRoom() map[string]map[string]bool
+	GetClientsInRoom() map[string]map[string]*client
 
 	ConnectClient(client *client)
 
@@ -62,7 +62,7 @@ type meshServer struct {
 	isbroadcaston    bool
 	clients          map[string]*client
 	rooms            map[string]*room
-	clientsinroom    map[string]map[string]bool
+	clientsinroom    map[string]map[string]*client
 	roomcnt          int
 	clientConnect    chan *client
 	clientDisconnect chan *client
@@ -88,18 +88,18 @@ func NewMeshServer(name string, meshconf *MeshServerConfig, rd RoomData) *meshSe
 		isbroadcaston: meshconf.DirectBroadCast,
 		clients:       make(map[string]*client),
 		rooms:         make(map[string]*room),
-		clientsinroom: make(map[string]map[string]bool),
+		clientsinroom: make(map[string]map[string]*client),
 
-		clientConnect:    make(chan *client),
-		clientDisconnect: make(chan *client),
+		clientConnect:    make(chan *client, 1),
+		clientDisconnect: make(chan *client, 1),
 
-		roomCreate: make(chan []string),
-		roomDelete: make(chan string),
+		roomCreate: make(chan []string, 1),
+		roomDelete: make(chan string, 1),
 
-		clientJoinedRoom: make(chan []interface{}),
-		clientLeftRoom:   make(chan []string),
+		clientJoinedRoom: make(chan []interface{}, 1),
+		clientLeftRoom:   make(chan []string, 1),
 
-		processMessage:    make(chan *Message),    //unbuffered channel unlike of send of client cause it will recieve only when readpump sends in it else it will block
+		processMessage:    make(chan *Message, 1), //unbuffered channel unlike of send of client cause it will recieve only when readpump sends in it else it will block
 		clientInRoomEvent: make(chan []string, 1), //view into the maps is your room affected by client changes
 
 		roomdata: rd,
@@ -188,8 +188,11 @@ func (server *meshServer) GetRooms() []string {
 	return roomslist
 }
 
-func (server *meshServer) GetClientsInRoom() map[string]map[string]bool {
-	return server.clientsinroom
+func (server *meshServer) GetClientsInRoom() map[string]map[string]*client {
+	server.mu.Lock()
+	res := server.clientsinroom
+	server.mu.Unlock()
+	return res
 }
 
 func (server *meshServer) PushMessage() chan<- *Message {
@@ -221,6 +224,7 @@ func (server *meshServer) DisconnectClient(client *client) {
 	for roomname, clientsmap := range server.clientsinroom {
 		if _, ok := clientsmap[client.slug]; ok {
 			delete(clientsmap, client.slug)
+			delete(server.rooms[roomname].clientsinroom, client.slug)
 			log.Println("removing client from the room")
 			if roomname != MeshGlobalRoom {
 				select {
@@ -273,7 +277,7 @@ func (server *meshServer) BroadcastMessage(message *Message) {
 	log.Println("Broadcasting message ----", string(jsonBytes))
 	if message.IsTargetClient {
 
-		client := server.clients[message.Sender]
+		client := server.clients[message.Target]
 		log.Println("Pushing to client :-", client.slug)
 
 		client.send <- jsonBytes
@@ -304,11 +308,13 @@ func (server *meshServer) JoinClientRoom(roomname string, clientname string, rd 
 	for roomkey := range server.rooms {
 		if roomkey == roomname {
 			if clientinroom, ok := server.clientsinroom[roomkey]; ok {
-				clientinroom[clientname] = true
+				clientinroom[clientname] = server.clients[clientname]
 			} else {
-				server.clientsinroom[roomkey] = map[string]bool{}
-				server.clientsinroom[roomkey][clientname] = true
+				server.clientsinroom[roomkey] = map[string]*client{}
+				server.clientsinroom[roomkey][clientname] = server.clients[clientname]
 			}
+			//copy it to the room and keep it updated
+			server.rooms[roomname].clientsinroom = server.clientsinroom[roomname]
 			select {
 			case server.rooms[roomname].clientInRoomEvent <- []string{"client-joined-room", roomname, clientname}:
 				log.Println("client ", clientname, " joined a room ", roomname)
@@ -329,10 +335,11 @@ func (server *meshServer) RemoveClientRoom(roomname string, clientname string) {
 	defer server.mu.Unlock()
 	if clientsmap, ok := server.clientsinroom[roomname]; ok {
 		delete(clientsmap, clientname)
+		delete(server.rooms[roomname].clientsinroom, clientname)
 		server.clientInRoomEvent <- []string{"client-left-room", roomname, clientname}
 		select {
 		case server.rooms[roomname].clientInRoomEvent <- []string{"client-left-room", roomname, clientname}:
-			log.Println("client ", clientname, " left a room ", roomname)
+			log.Println("client ", clientname, " removed from a room ", roomname)
 		default:
 			log.Println("Failed to trigger left room trigger for client ", clientname, " in room", roomname)
 		}
